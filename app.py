@@ -4,7 +4,7 @@ import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from dateutil.parser import parse
-from dateutil import tz  # <-- Make sure this is imported
+from dateutil import tz
 from datetime import datetime, timedelta
 import google.oauth2.service_account
 from googleapiclient.discovery import build
@@ -51,37 +51,42 @@ def get_availability():
         # --- Scenario 1: User requested a specific time ---
         if requested_start_str:
             try:
-                # ✅ FIX: This line now assumes any time provided is in SAST (UTC+2)
-                # It will correctly convert the user's local time to UTC for the server.
-                sast_tz = tz.gettz('Africa/Johannesburg')
-                requested_start = parse(requested_start_str, default=datetime.now(sast_tz)).astimezone(utc)
+                # ✅ FIX: This section now correctly handles the timezone.
+                # 1. Parse the incoming time string without any timezone info.
+                naive_dt = parse(requested_start_str)
+                # 2. Get the South Africa timezone.
+                sast_tz = pytz.timezone('Africa/Johannesburg')
+                # 3. Explicitly tell Python that the "naive" time is actually in SAST.
+                sast_dt = sast_tz.localize(naive_dt)
+                # 4. Convert the now timezone-aware SAST time to universal time (UTC) for comparison.
+                requested_start = sast_dt.astimezone(utc)
 
             except (ValueError, TypeError):
                 return jsonify({"error": "Invalid date format. Please state the date and time again."}), 400
-            
+
             requested_end = requested_start + timedelta(minutes=60)
 
+            # This comparison now correctly compares two UTC times.
             if requested_start < now:
                 return jsonify({"status": "unavailable", "message": "Sorry, that time is in the past."})
-            
-            # Business hours (9 AM to 5 PM SAST is 7:00 to 17:00 UTC)
+
             if not (7 <= requested_start.hour and requested_end.hour <= 17):
                 return jsonify({"status": "unavailable", "message": "Apologies, that's outside our business hours of 9 AM to 5 PM."})
 
             events_result = service.events().list(
                 calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start.isoformat(),
                 timeMax=requested_end.isoformat(), singleEvents=True).execute()
-            
+
             if not events_result.get('items', []):
                 return jsonify({"status": "available", "iso_8601": requested_start.isoformat()})
             else:
                 # Fall through to find other slots if the requested one is busy
                 pass
-        
+
         # --- Scenario 2: Find next available slots ---
         search_start_time = now + timedelta(minutes=15)
         end_of_search_window = now + timedelta(days=14)
-        
+
         all_busy_slots_result = service.events().list(
             calendarId=GOOGLE_CALENDAR_ID, timeMin=now.isoformat(),
             timeMax=end_of_search_window.isoformat(), singleEvents=True, orderBy='startTime').execute()
@@ -89,7 +94,7 @@ def get_availability():
 
         next_available_slots = []
         check_time = search_start_time
-        
+
         while len(next_available_slots) < 5 and check_time < end_of_search_window:
             potential_end_time = check_time + timedelta(minutes=60)
             if 7 <= check_time.hour and potential_end_time.hour < 17:
@@ -112,7 +117,7 @@ def get_availability():
             dt = parse(slot_iso)
             human_readable = dt.strftime('%A, %B %d at %I:%M %p')
             formatted_suggestions.append({"human_readable": human_readable, "iso_8601": slot_iso})
-            
+
         if requested_start_str:
              return jsonify({
                 "status": "unavailable",
