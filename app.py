@@ -4,6 +4,7 @@ import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from dateutil.parser import parse
+from dateutil import tz
 from datetime import datetime, timedelta
 import google.oauth2.service_account
 from googleapiclient.discovery import build
@@ -42,114 +43,90 @@ def health_check():
 # --- Main API Endpoints ---
 @app.route('/get-availability', methods=['POST'])
 def get_availability():
-    """
-    Checks if a requested 1-hour time slot is available.
-    If it is, confirms it.
-    If not, finds the next two available 1-hour slots.
-    """
     try:
-        data = request.json
-        if not data or 'start_time' not in data:
-            return jsonify({"error": "A 'start_time' must be provided."}), 400
-
-        # --- 1. Check Availability of the Requested Time ---
-        try:
-            requested_start = parse(data['start_time']).astimezone(utc)
-        except ValueError:
-            return jsonify({"error": "Invalid date format for 'start_time'. Use ISO 8601 format."}), 400
-            
-        requested_end = requested_start + timedelta(minutes=60)
+        data = request.json or {}
+        requested_start_str = data.get('start_time')
         now = datetime.utcnow().replace(tzinfo=utc)
 
-        # Ensure the requested time is in the future
-        if requested_start < now:
-            return jsonify({
-                "status": "unavailable",
-                "message": "Sorry, that time is in the past. Please suggest a future time."
-            })
+        # --- Scenario 1: User requested a specific time ---
+        if requested_start_str:
+            try:
+                # ✅ FIX: Teach the parser about the SAST timezone (UTC+2).
+                # It will assume any time without timezone info is in SAST.
+                sast_tz = tz.gettz('Africa/Johannesburg')
+                requested_start = parse(requested_start_str, tzinfos={'SAST': sast_tz}).astimezone(utc)
+            except (ValueError, TypeError):
+                return jsonify({"error": "Invalid date format. Use ISO 8601."}), 400
             
-        # Define business hours (9 AM to 5 PM SAST is 7:00 to 17:00 UTC)
-        if not (7 <= requested_start.hour and requested_end.hour < 17):
+            requested_end = requested_start + timedelta(minutes=60)
+
+            # This comparison now correctly compares two UTC times.
+            if requested_start < now:
+                return jsonify({"status": "unavailable", "message": "Sorry, that time is in the past."})
+            
+            if not (7 <= requested_start.hour and requested_end.hour < 17):
+                return jsonify({"status": "unavailable", "message": "Sorry, that's outside our business hours of 9 AM to 5 PM."})
+
+            events_result = service.events().list(
+                calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start.isoformat(),
+                timeMax=requested_end.isoformat(), singleEvents=True).execute()
+            
+            if not events_result.get('items', []):
+                return jsonify({"status": "available", "iso_8601": requested_start.isoformat()})
+            else:
+                # Fall through to find other slots if the requested one is busy
+                pass
+        
+        # --- Scenario 2: Find next available slots ---
+        search_start_time = now + timedelta(minutes=15)
+        end_of_search_window = now + timedelta(days=14)
+        
+        all_busy_slots_result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID, timeMin=now.isoformat(),
+            timeMax=end_of_search_window.isoformat(), singleEvents=True, orderBy='startTime').execute()
+        all_busy_slots = all_busy_slots_result.get('items', [])
+
+        next_available_slots = []
+        check_time = search_start_time
+        
+        while len(next_available_slots) < 5 and check_time < end_of_search_window:
+            potential_end_time = check_time + timedelta(minutes=60)
+            if 7 <= check_time.hour and potential_end_time.hour < 17:
+                is_free = True
+                for event in all_busy_slots:
+                    event_start = parse(event['start'].get('dateTime'))
+                    event_end = parse(event['end'].get('dateTime'))
+                    if check_time < event_end and potential_end_time > event_start:
+                        is_free = False
+                        break
+                if is_free:
+                    next_available_slots.append(check_time.isoformat())
+            check_time += timedelta(minutes=15)
+
+        if not next_available_slots:
+            return jsonify({"status": "unavailable", "message": "Sorry, I couldn't find any open 1-hour slots in the next two weeks."})
+
+        formatted_suggestions = []
+        for slot_iso in next_available_slots:
+            dt = parse(slot_iso)
+            human_readable = dt.strftime('%A, %B %d at %I:%M %p')
+            formatted_suggestions.append({"human_readable": human_readable, "iso_8601": slot_iso})
+            
+        if requested_start_str:
              return jsonify({
                 "status": "unavailable",
-                "message": "Sorry, that time is outside of our business hours, which are 9 AM to 5 PM."
+                "message": "Unfortunately, that time is not available. Some other times that work are:",
+                "next_available_slots": formatted_suggestions
             })
-
-        # Check for conflicting events
-        events_result = service.events().list(
-            calendarId=GOOGLE_CALENDAR_ID,
-            timeMin=requested_start.isoformat(),
-            timeMax=requested_end.isoformat(),
-            singleEvents=True,
-        ).execute()
-        
-        if not events_result.get('items', []):
-            # The requested slot is available!
-            return jsonify({
-                "status": "available",
-                "iso_8601": requested_start.isoformat()
-            })
-
-        # --- 2. If Unavailable, Find the Next Two Slots ---
         else:
-            search_start_time = requested_start + timedelta(minutes=15)
-            end_of_search_window = now + timedelta(days=14)
-            
-            # Get all busy events for the next two weeks to check against
-            all_busy_slots_result = service.events().list(
-                calendarId=GOOGLE_CALENDAR_ID,
-                timeMin=now.isoformat(),
-                timeMax=end_of_search_window.isoformat(),
-                singleEvents=True,
-                orderBy='startTime'
-            ).execute()
-            all_busy_slots = all_busy_slots_result.get('items', [])
-
-            next_available_slots = []
-            check_time = search_start_time
-            
-            while len(next_available_slots) < 2 and check_time < end_of_search_window:
-                potential_end_time = check_time + timedelta(minutes=60)
-                
-                if 7 <= check_time.hour and potential_end_time.hour < 17:
-                    is_free = True
-                    for event in all_busy_slots:
-                        event_start = parse(event['start'].get('dateTime'))
-                        event_end = parse(event['end'].get('dateTime'))
-                        if check_time < event_end and potential_end_time > event_start:
-                            is_free = False
-                            break
-                    if is_free:
-                        next_available_slots.append(check_time.isoformat())
-                
-                check_time += timedelta(minutes=15)
-
-            if not next_available_slots:
-                return jsonify({
-                    "status": "unavailable",
-                    "message": "Sorry, that time is unavailable, and I couldn't find any other openings in the next two weeks."
-                })
-
-            # Format the suggested slots for the agent
-            formatted_suggestions = []
-            for slot_iso in next_available_slots:
-                dt = parse(slot_iso)
-                human_readable = dt.strftime('%A, %B %d at %I:%M %p')
-                formatted_suggestions.append({
-                    "human_readable": human_readable,
-                    "iso_8601": slot_iso
-                })
-                
-            return jsonify({
-                "status": "unavailable",
-                "message": f"Unfortunately, that time is not available. The next two open 1-hour slots I have are:",
+             return jsonify({
+                "status": "available_slots_found",
                 "next_available_slots": formatted_suggestions
             })
 
     except Exception as e:
         print(f"A general error occurred in /get-availability: {e}")
         return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
-
 
 @app.route('/book-appointment', methods=['POST'])
 def book_appointment():
