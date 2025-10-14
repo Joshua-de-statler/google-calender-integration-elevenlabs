@@ -32,6 +32,7 @@ credentials = google.oauth2.service_account.Credentials.from_service_account_inf
     GOOGLE_CREDENTIALS_DICT, scopes=SCOPES
 )
 service = build('calendar', 'v3', credentials=credentials)
+utc = pytz.UTC
 
 # --- Health Check Endpoint ---
 @app.route('/', methods=['GET'])
@@ -41,85 +42,109 @@ def health_check():
 # --- Main API Endpoints ---
 @app.route('/get-availability', methods=['POST'])
 def get_availability():
+    """
+    Checks if a requested 1-hour time slot is available.
+    If it is, confirms it.
+    If not, finds the next two available 1-hour slots.
+    """
     try:
-        data = request.json or {}
-        # The agent can optionally pass a specific date to check
-        requested_date_str = data.get('date')
+        data = request.json
+        if not data or 'start_time' not in data:
+            return jsonify({"error": "A 'start_time' must be provided."}), 400
 
-        utc = pytz.UTC
+        # --- 1. Check Availability of the Requested Time ---
+        try:
+            requested_start = parse(data['start_time']).astimezone(utc)
+        except ValueError:
+            return jsonify({"error": "Invalid date format for 'start_time'. Use ISO 8601 format."}), 400
+            
+        requested_end = requested_start + timedelta(minutes=60)
         now = datetime.utcnow().replace(tzinfo=utc)
-        
-        # Determine the search window
-        if requested_date_str:
-            try:
-                # Search a specific day requested by the user
-                start_of_day = parse(requested_date_str).replace(hour=0, minute=0, second=0, tzinfo=utc)
-                # If the user asks for a day in the past, search today instead
-                if start_of_day < now.replace(hour=0, minute=0, second=0, microsecond=0):
-                    start_of_search = now + timedelta(minutes=5)
-                    end_of_search = start_of_search.replace(hour=23, minute=59, second=59)
-                else:
-                    start_of_search = start_of_day
-                    end_of_search = start_of_day.replace(hour=23, minute=59, second=59)
-            except (ValueError, TypeError):
-                # If date parsing fails, default to the next 7 days
-                start_of_search = now + timedelta(minutes=5)
-                end_of_search = now + timedelta(days=7)
-        else:
-            # Default to searching the next 7 days
-            start_of_search = now + timedelta(minutes=5)
-            end_of_search = now + timedelta(days=7)
 
+        # Ensure the requested time is in the future
+        if requested_start < now:
+            return jsonify({
+                "status": "unavailable",
+                "message": "Sorry, that time is in the past. Please suggest a future time."
+            })
+            
+        # Define business hours (9 AM to 5 PM SAST is 7:00 to 17:00 UTC)
+        if not (7 <= requested_start.hour and requested_end.hour < 17):
+             return jsonify({
+                "status": "unavailable",
+                "message": "Sorry, that time is outside of our business hours, which are 9 AM to 5 PM."
+            })
+
+        # Check for conflicting events
         events_result = service.events().list(
             calendarId=GOOGLE_CALENDAR_ID,
-            timeMin=start_of_search.isoformat(),
-            timeMax=end_of_search.isoformat(),
+            timeMin=requested_start.isoformat(),
+            timeMax=requested_end.isoformat(),
             singleEvents=True,
-            orderBy='startTime'
         ).execute()
-        busy_slots = events_result.get('items', [])
-
-        free_slots = []
-        session_duration = timedelta(minutes=60)
         
-        # Start checking for slots from the beginning of our search window
-        check_time = start_of_search.replace(tzinfo=utc)
-        
-        while len(free_slots) < 5 and check_time < end_of_search:
-            potential_end_time = check_time + session_duration
-
-            # Define business hours (9 AM to 5 PM SAST is 7:00 to 17:00 UTC)
-            # and ensure the full 1-hour slot fits within these hours.
-            if 7 <= check_time.hour and potential_end_time.hour < 17:
-                is_free = True
-                # Check for overlaps with any existing busy events
-                for event in busy_slots:
-                    event_start = parse(event['start'].get('dateTime'))
-                    event_end = parse(event['end'].get('dateTime'))
-                    # Overlap condition: (StartA < EndB) and (EndA > StartB)
-                    if check_time < event_end and potential_end_time > event_start:
-                        is_free = False
-                        break  # This slot is busy, move to the next check
-                
-                if is_free:
-                    free_slots.append(check_time.isoformat())
-
-            # Move to the next 15-minute increment to check for the next potential slot
-            check_time += timedelta(minutes=15)
-
-        if not free_slots:
-            return jsonify({"message": f"Sorry, no 1-hour slots are available for the requested period."})
-
-        # Format the found slots for the agent to read out
-        formatted_times = []
-        for slot_iso in free_slots:
-            dt = parse(slot_iso)
-            human_readable = dt.strftime('%A, %B %d at %I:%M %p')
-            formatted_times.append({
-                "human_readable": human_readable,
-                "iso_8601": slot_iso
+        if not events_result.get('items', []):
+            # The requested slot is available!
+            return jsonify({
+                "status": "available",
+                "iso_8601": requested_start.isoformat()
             })
-        return jsonify({"available_slots": formatted_times})
+
+        # --- 2. If Unavailable, Find the Next Two Slots ---
+        else:
+            search_start_time = requested_start + timedelta(minutes=15)
+            end_of_search_window = now + timedelta(days=14)
+            
+            # Get all busy events for the next two weeks to check against
+            all_busy_slots_result = service.events().list(
+                calendarId=GOOGLE_CALENDAR_ID,
+                timeMin=now.isoformat(),
+                timeMax=end_of_search_window.isoformat(),
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+            all_busy_slots = all_busy_slots_result.get('items', [])
+
+            next_available_slots = []
+            check_time = search_start_time
+            
+            while len(next_available_slots) < 2 and check_time < end_of_search_window:
+                potential_end_time = check_time + timedelta(minutes=60)
+                
+                if 7 <= check_time.hour and potential_end_time.hour < 17:
+                    is_free = True
+                    for event in all_busy_slots:
+                        event_start = parse(event['start'].get('dateTime'))
+                        event_end = parse(event['end'].get('dateTime'))
+                        if check_time < event_end and potential_end_time > event_start:
+                            is_free = False
+                            break
+                    if is_free:
+                        next_available_slots.append(check_time.isoformat())
+                
+                check_time += timedelta(minutes=15)
+
+            if not next_available_slots:
+                return jsonify({
+                    "status": "unavailable",
+                    "message": "Sorry, that time is unavailable, and I couldn't find any other openings in the next two weeks."
+                })
+
+            # Format the suggested slots for the agent
+            formatted_suggestions = []
+            for slot_iso in next_available_slots:
+                dt = parse(slot_iso)
+                human_readable = dt.strftime('%A, %B %d at %I:%M %p')
+                formatted_suggestions.append({
+                    "human_readable": human_readable,
+                    "iso_8601": slot_iso
+                })
+                
+            return jsonify({
+                "status": "unavailable",
+                "message": f"Unfortunately, that time is not available. The next two open 1-hour slots I have are:",
+                "next_available_slots": formatted_suggestions
+            })
 
     except Exception as e:
         print(f"A general error occurred in /get-availability: {e}")
@@ -137,7 +162,6 @@ def book_appointment():
         first_name = name_parts[0]
         
         start_time_dt = parse(data["start_time"])
-        # ✅ **MODIFICATION:** Duration is now 60 minutes.
         end_time_dt = start_time_dt + timedelta(minutes=60)
 
         event = {
