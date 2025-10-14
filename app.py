@@ -4,7 +4,6 @@ import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from dateutil.parser import parse
-from dateutil import tz
 from datetime import datetime, timedelta
 import google.oauth2.service_account
 from googleapiclient.discovery import build
@@ -27,13 +26,14 @@ try:
 except json.JSONDecodeError:
     raise ValueError("GOOGLE_CREDENTIALS_JSON is not a valid JSON string.")
 
-# --- Google API Setup ---
+# --- Google API & Timezone Setup ---
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 credentials = google.oauth2.service_account.Credentials.from_service_account_info(
     GOOGLE_CREDENTIALS_DICT, scopes=SCOPES
 )
 service = build('calendar', 'v3', credentials=credentials)
-utc = pytz.UTC
+UTC = pytz.utc
+SAST = pytz.timezone('Africa/Johannesburg')
 
 # --- Health Check Endpoint ---
 @app.route('/', methods=['GET'])
@@ -46,82 +46,89 @@ def get_availability():
     try:
         data = request.json or {}
         requested_start_str = data.get('start_time')
-        now = datetime.utcnow().replace(tzinfo=utc)
+        
+        # Get the current time in SAST for accurate "now" comparison
+        now_sast = datetime.now(SAST)
 
         # --- Scenario 1: User requested a specific time ---
         if requested_start_str:
             try:
-                # ✅ FIX: This section now correctly handles the timezone.
-                # 1. Parse the incoming time string without any timezone info.
+                # Parse the incoming time, assuming it's a local SAST time
                 naive_dt = parse(requested_start_str)
-                # 2. Get the South Africa timezone.
-                sast_tz = pytz.timezone('Africa/Johannesburg')
-                # 3. Explicitly tell Python that the "naive" time is actually in SAST.
-                sast_dt = sast_tz.localize(naive_dt)
-                # 4. Convert the now timezone-aware SAST time to universal time (UTC) for comparison.
-                requested_start = sast_dt.astimezone(utc)
-
+                # Localize the naive datetime to SAST
+                requested_start_sast = SAST.localize(naive_dt)
             except (ValueError, TypeError):
                 return jsonify({"error": "Invalid date format. Please state the date and time again."}), 400
+            
+            # This comparison is now accurate because both times are in SAST
+            if requested_start_sast < now_sast:
+                return jsonify({"status": "unavailable", "message": "Sorry, that time is in the past. Please suggest a future time."})
+            
+            # Check if the time is within business hours (Mon-Fri, 8 AM to 4 PM SAST)
+            # 0=Monday, 4=Friday
+            if not (0 <= requested_start_sast.weekday() <= 4 and 8 <= requested_start_sast.hour < 16):
+                 return jsonify({"status": "unavailable", "message": "Apologies, that's outside our business hours of Monday to Friday, 8 AM to 4 PM."})
 
-            requested_end = requested_start + timedelta(minutes=60)
+            # Convert to UTC for Google API call
+            requested_start_utc = requested_start_sast.astimezone(UTC)
+            requested_end_utc = requested_start_utc + timedelta(minutes=60)
 
-            # This comparison now correctly compares two UTC times.
-            if requested_start < now:
-                return jsonify({"status": "unavailable", "message": "Sorry, that time is in the past."})
-
-            if not (7 <= requested_start.hour and requested_end.hour <= 17):
-                return jsonify({"status": "unavailable", "message": "Apologies, that's outside our business hours of 9 AM to 5 PM."})
-
+            # Check for conflicting events
             events_result = service.events().list(
-                calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start.isoformat(),
-                timeMax=requested_end.isoformat(), singleEvents=True).execute()
-
+                calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start_utc.isoformat(),
+                timeMax=requested_end_utc.isoformat(), singleEvents=True).execute()
+            
             if not events_result.get('items', []):
-                return jsonify({"status": "available", "iso_8601": requested_start.isoformat()})
+                return jsonify({"status": "available", "iso_8601": requested_start_utc.isoformat()})
             else:
-                # Fall through to find other slots if the requested one is busy
+                # If busy, fall through to find the next available slots
                 pass
-
-        # --- Scenario 2: Find next available slots ---
-        search_start_time = now + timedelta(minutes=15)
-        end_of_search_window = now + timedelta(days=14)
-
+        
+        # --- Scenario 2: Find the next available slots ---
+        now_utc = now_sast.astimezone(UTC)
+        search_start_time = now_utc + timedelta(minutes=15)
+        end_of_search_window = now_utc + timedelta(days=14)
+        
         all_busy_slots_result = service.events().list(
-            calendarId=GOOGLE_CALENDAR_ID, timeMin=now.isoformat(),
+            calendarId=GOOGLE_CALENDAR_ID, timeMin=now_utc.isoformat(),
             timeMax=end_of_search_window.isoformat(), singleEvents=True, orderBy='startTime').execute()
         all_busy_slots = all_busy_slots_result.get('items', [])
 
         next_available_slots = []
-        check_time = search_start_time
-
-        while len(next_available_slots) < 5 and check_time < end_of_search_window:
-            potential_end_time = check_time + timedelta(minutes=60)
-            if 7 <= check_time.hour and potential_end_time.hour < 17:
+        check_time_utc = search_start_time
+        
+        while len(next_available_slots) < 5 and check_time_utc < end_of_search_window:
+            potential_end_time_utc = check_time_utc + timedelta(minutes=60)
+            check_time_sast = check_time_utc.astimezone(SAST)
+            
+            # Enforce business hours: Mon-Fri, 8 AM to 4 PM SAST
+            if (0 <= check_time_sast.weekday() <= 4 and 8 <= check_time_sast.hour < 16):
                 is_free = True
                 for event in all_busy_slots:
                     event_start = parse(event['start'].get('dateTime'))
                     event_end = parse(event['end'].get('dateTime'))
-                    if check_time < event_end and potential_end_time > event_start:
+                    if check_time_utc < event_end and potential_end_time_utc > event_start:
                         is_free = False
                         break
                 if is_free:
-                    next_available_slots.append(check_time.isoformat())
-            check_time += timedelta(minutes=15)
+                    next_available_slots.append(check_time_utc.isoformat())
+            
+            check_time_utc += timedelta(minutes=15)
 
         if not next_available_slots:
             return jsonify({"status": "unavailable", "message": "Sorry, I couldn't find any open 1-hour slots in the next two weeks."})
 
         formatted_suggestions = []
         for slot_iso in next_available_slots:
-            dt = parse(slot_iso)
-            human_readable = dt.strftime('%A, %B %d at %I:%M %p')
+            dt_utc = parse(slot_iso)
+            dt_sast = dt_utc.astimezone(SAST)
+            human_readable = dt_sast.strftime('%A, %B %d at %-I:%M %p') # Use %-I for non-padded hour
             formatted_suggestions.append({"human_readable": human_readable, "iso_8601": slot_iso})
-
+            
         if requested_start_str:
              return jsonify({
                 "status": "unavailable",
-                "message": "Unfortunately, that time is not available. Some other times that work are:",
+                "message": "Unfortunately, that specific time is not available. However, some other times that work are:",
                 "next_available_slots": formatted_suggestions
             })
         else:
@@ -129,7 +136,6 @@ def get_availability():
                 "status": "available_slots_found",
                 "next_available_slots": formatted_suggestions
             })
-
 
     except Exception as e:
         print(f"A general error occurred in /get-availability: {e}")
