@@ -4,7 +4,7 @@ import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from dateutil.parser import parse
-from dateutil import tz
+from dateutil import tz  # <-- Make sure this is imported
 from datetime import datetime, timedelta
 import google.oauth2.service_account
 from googleapiclient.discovery import build
@@ -51,21 +51,22 @@ def get_availability():
         # --- Scenario 1: User requested a specific time ---
         if requested_start_str:
             try:
-                # ✅ FIX: Teach the parser about the SAST timezone (UTC+2).
-                # It will assume any time without timezone info is in SAST.
+                # ✅ FIX: This line now assumes any time provided is in SAST (UTC+2)
+                # It will correctly convert the user's local time to UTC for the server.
                 sast_tz = tz.gettz('Africa/Johannesburg')
-                requested_start = parse(requested_start_str, tzinfos={'SAST': sast_tz}).astimezone(utc)
+                requested_start = parse(requested_start_str, default=datetime.now(sast_tz)).astimezone(utc)
+
             except (ValueError, TypeError):
-                return jsonify({"error": "Invalid date format. Use ISO 8601."}), 400
+                return jsonify({"error": "Invalid date format. Please state the date and time again."}), 400
             
             requested_end = requested_start + timedelta(minutes=60)
 
-            # This comparison now correctly compares two UTC times.
             if requested_start < now:
                 return jsonify({"status": "unavailable", "message": "Sorry, that time is in the past."})
             
-            if not (7 <= requested_start.hour and requested_end.hour < 17):
-                return jsonify({"status": "unavailable", "message": "Sorry, that's outside our business hours of 9 AM to 5 PM."})
+            # Business hours (9 AM to 5 PM SAST is 7:00 to 17:00 UTC)
+            if not (7 <= requested_start.hour and requested_end.hour <= 17):
+                return jsonify({"status": "unavailable", "message": "Apologies, that's outside our business hours of 9 AM to 5 PM."})
 
             events_result = service.events().list(
                 calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start.isoformat(),
@@ -123,6 +124,7 @@ def get_availability():
                 "status": "available_slots_found",
                 "next_available_slots": formatted_suggestions
             })
+
 
     except Exception as e:
         print(f"A general error occurred in /get-availability: {e}")
