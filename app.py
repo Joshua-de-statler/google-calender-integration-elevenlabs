@@ -32,7 +32,7 @@ credentials = google.oauth2.service_account.Credentials.from_service_account_inf
     GOOGLE_CREDENTIALS_DICT, scopes=SCOPES
 )
 service = build('calendar', 'v3', credentials=credentials)
-# The code will now think and operate in SAST
+UTC = pytz.utc
 SAST = pytz.timezone('Africa/Johannesburg')
 
 # --- Health Check Endpoint ---
@@ -68,52 +68,58 @@ def get_availability():
             if not (0 <= requested_start_sast.weekday() <= 4 and 8 <= requested_start_sast.hour < 16):
                  return jsonify({"status": "unavailable", "message": "Apologies, that's outside our business hours of Monday to Friday, 8 AM to 4 PM."})
 
-            requested_end_sast = requested_start_sast + timedelta(minutes=60)
+            # Convert to UTC for Google API call
+            requested_start_utc = requested_start_sast.astimezone(UTC)
+            requested_end_utc = requested_start_utc + timedelta(minutes=60)
 
-            # Check for conflicting events using SAST timestamps
+            # Check for conflicting events
             events_result = service.events().list(
-                calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start_sast.isoformat(),
-                timeMax=requested_end_sast.isoformat(), singleEvents=True).execute()
+                calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start_utc.isoformat(),
+                timeMax=requested_end_utc.isoformat(), singleEvents=True).execute()
             
             if not events_result.get('items', []):
-                return jsonify({"status": "available", "iso_8601": requested_start_sast.isoformat()})
+                return jsonify({"status": "available", "iso_8601": requested_start_utc.isoformat()})
             else:
                 pass # Fall through to find other slots
         
         # --- Scenario 2: Find the next available slots ---
-        search_start_time = now_sast + timedelta(minutes=15)
-        end_of_search_window = now_sast + timedelta(days=14)
+        now_utc = now_sast.astimezone(UTC)
+        search_start_time = now_utc + timedelta(minutes=15)
+        end_of_search_window = now_utc + timedelta(days=14)
         
         all_busy_slots_result = service.events().list(
-            calendarId=GOOGLE_CALENDAR_ID, timeMin=now_sast.isoformat(),
+            calendarId=GOOGLE_CALENDAR_ID, timeMin=now_utc.isoformat(),
             timeMax=end_of_search_window.isoformat(), singleEvents=True, orderBy='startTime').execute()
         all_busy_slots = all_busy_slots_result.get('items', [])
 
         next_available_slots = []
-        check_time_sast = search_start_time
+        check_time_utc = search_start_time
         
-        while len(next_available_slots) < 5 and check_time_sast < end_of_search_window:
-            potential_end_time_sast = check_time_sast + timedelta(minutes=60)
+        while len(next_available_slots) < 5 and check_time_utc < end_of_search_window:
+            potential_end_time_utc = check_time_utc + timedelta(minutes=60)
+            check_time_sast = check_time_utc.astimezone(SAST)
             
+            # Enforce business hours: Mon-Fri, 8 AM to 4 PM SAST
             if (0 <= check_time_sast.weekday() <= 4 and 8 <= check_time_sast.hour < 16):
                 is_free = True
                 for event in all_busy_slots:
-                    event_start = parse(event['start'].get('dateTime')).astimezone(SAST)
-                    event_end = parse(event['end'].get('dateTime')).astimezone(SAST)
-                    if check_time_sast < event_end and potential_end_time_sast > event_start:
+                    event_start = parse(event['start'].get('dateTime'))
+                    event_end = parse(event['end'].get('dateTime'))
+                    if check_time_utc < event_end and potential_end_time_utc > event_start:
                         is_free = False
                         break
                 if is_free:
-                    next_available_slots.append(check_time_sast.isoformat())
+                    next_available_slots.append(check_time_utc.isoformat())
             
-            check_time_sast += timedelta(minutes=15)
+            check_time_utc += timedelta(minutes=15)
 
         if not next_available_slots:
             return jsonify({"status": "unavailable", "message": "Sorry, I couldn't find any open 1-hour slots in the next two weeks."})
 
         formatted_suggestions = []
         for slot_iso in next_available_slots:
-            dt_sast = parse(slot_iso)
+            dt_utc = parse(slot_iso)
+            dt_sast = dt_utc.astimezone(SAST)
             human_readable = dt_sast.strftime('%A, %B %d at %-I:%M %p') # Use %-I for non-padded hour
             formatted_suggestions.append({"human_readable": human_readable, "iso_8601": slot_iso})
             
@@ -138,6 +144,7 @@ def book_appointment():
         name_parts = data["name"].strip().split(' ', 1)
         first_name = name_parts[0]
         
+        # The start_time from the tool is already in UTC, so we can use it directly
         start_time_dt = parse(data["start_time"])
         end_time_dt = start_time_dt + timedelta(minutes=60)
 
@@ -145,8 +152,8 @@ def book_appointment():
             'summary': f'Onboarding Call with {data["name"]}',
             'location': 'Video Call - Link to follow',
             'description': f'A 60-minute onboarding call for {data["name"]}. Invitee email: {data["email"]}',
-            'start': {'dateTime': start_time_dt.isoformat(), 'timeZone': 'Africa/Johannesburg'},
-            'end': {'dateTime': end_time_dt.isoformat(), 'timeZone': 'Africa/Johannesburg'},
+            'start': {'dateTime': start_time_dt.isoformat(), 'timeZone': 'UTC'},
+            'end': {'dateTime': end_time_dt.isoformat(), 'timeZone': 'UTC'},
             'reminders': {'useDefault': True},
         }
 
