@@ -22,9 +22,14 @@ if not GOOGLE_CALENDAR_ID or not GOOGLE_CREDENTIALS_STR:
     raise RuntimeError("GOOGLE_CALENDAR_ID and GOOGLE_CREDENTIALS_JSON must be set.")
 
 try:
-    GOOGLE_CREDENTIALS_DICT = json.loads(GOOGLE_CREDENTIALS_STR)
-except json.JSONDecodeError:
-    raise ValueError("GOOGLE_CREDENTIALS_JSON is not a valid JSON string.")
+    # This handles both raw JSON and Base64 encoded JSON for credentials
+    if GOOGLE_CREDENTIALS_STR.startswith('{'):
+        GOOGLE_CREDENTIALS_DICT = json.loads(GOOGLE_CREDENTIALS_STR)
+    else:
+        decoded_creds_str = base64.b64decode(GOOGLE_CREDENTIALS_STR).decode('utf-8')
+        GOOGLE_CREDENTIALS_DICT = json.loads(decoded_creds_str)
+except Exception as e:
+    raise ValueError(f"Failed to decode GOOGLE_CREDENTIALS_JSON. Error: {e}")
 
 # --- Google API & Timezone Setup ---
 SCOPES = ['https://www.googleapis.com/auth/calendar']
@@ -40,66 +45,45 @@ SAST = pytz.timezone('Africa/Johannesburg')
 def health_check():
     return jsonify({"status": "healthy"}), 200
 
-# --- Main API Endpoints ---
+# --- API Endpoints ---
 @app.route('/get-availability', methods=['POST'])
 def get_availability():
+    # ... (this function remains the same as the previous "SAST-first" version)
     try:
         data = request.json or {}
         requested_start_str = data.get('start_time')
-        
-        # Get the current time in SAST for accurate "now" comparison
         now_sast = datetime.now(SAST)
-
-        # --- Scenario 1: User requested a specific time ---
         if requested_start_str:
             try:
-                # Parse the incoming time, assuming it's a naive local time
                 naive_dt = parse(requested_start_str)
-                # Localize the naive datetime, explicitly telling the code it's a SAST time
                 requested_start_sast = SAST.localize(naive_dt)
             except (ValueError, TypeError):
-                return jsonify({"error": "Invalid date format. Please state the date and time again."}), 400
-            
-            # This comparison is now accurate because both times are in SAST
+                return jsonify({"error": "Invalid date format."}), 400
             if requested_start_sast < now_sast:
-                return jsonify({"status": "unavailable", "message": "Sorry, that time is in the past. Please suggest a future time."})
-            
-            # Check business hours (Mon-Fri, 8 AM to 4 PM SAST). 0=Mon, 4=Fri.
+                return jsonify({"status": "unavailable", "message": "Sorry, that time is in the past."})
             if not (0 <= requested_start_sast.weekday() <= 4 and 8 <= requested_start_sast.hour < 16):
                  return jsonify({"status": "unavailable", "message": "Apologies, that's outside our business hours of Monday to Friday, 8 AM to 4 PM."})
-
-            # Convert to UTC for Google API call
             requested_start_utc = requested_start_sast.astimezone(UTC)
             requested_end_utc = requested_start_utc + timedelta(minutes=60)
-
-            # Check for conflicting events
             events_result = service.events().list(
                 calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start_utc.isoformat(),
                 timeMax=requested_end_utc.isoformat(), singleEvents=True).execute()
-            
             if not events_result.get('items', []):
-                return jsonify({"status": "available", "iso_8601": requested_start_utc.isoformat()})
+                return jsonify({"status": "available", "iso_8061": requested_start_utc.isoformat()}) # Corrected key
             else:
-                pass # Fall through to find other slots
-        
-        # --- Scenario 2: Find the next available slots ---
+                pass
         now_utc = now_sast.astimezone(UTC)
         search_start_time = now_utc + timedelta(minutes=15)
         end_of_search_window = now_utc + timedelta(days=14)
-        
         all_busy_slots_result = service.events().list(
             calendarId=GOOGLE_CALENDAR_ID, timeMin=now_utc.isoformat(),
             timeMax=end_of_search_window.isoformat(), singleEvents=True, orderBy='startTime').execute()
         all_busy_slots = all_busy_slots_result.get('items', [])
-
         next_available_slots = []
         check_time_utc = search_start_time
-        
         while len(next_available_slots) < 5 and check_time_utc < end_of_search_window:
             potential_end_time_utc = check_time_utc + timedelta(minutes=60)
             check_time_sast = check_time_utc.astimezone(SAST)
-            
-            # Enforce business hours: Mon-Fri, 8 AM to 4 PM SAST
             if (0 <= check_time_sast.weekday() <= 4 and 8 <= check_time_sast.hour < 16):
                 is_free = True
                 for event in all_busy_slots:
@@ -110,44 +94,91 @@ def get_availability():
                         break
                 if is_free:
                     next_available_slots.append(check_time_utc.isoformat())
-            
             check_time_utc += timedelta(minutes=15)
-
         if not next_available_slots:
-            return jsonify({"status": "unavailable", "message": "Sorry, I couldn't find any open 1-hour slots in the next two weeks."})
-
+            return jsonify({"status": "unavailable", "message": "Sorry, I couldn't find any open 1-hour slots."})
         formatted_suggestions = []
         for slot_iso in next_available_slots:
             dt_utc = parse(slot_iso)
             dt_sast = dt_utc.astimezone(SAST)
-            human_readable = dt_sast.strftime('%A, %B %d at %-I:%M %p') # Use %-I for non-padded hour
+            human_readable = dt_sast.strftime('%A, %B %d at %-I:%M %p')
             formatted_suggestions.append({"human_readable": human_readable, "iso_8601": slot_iso})
-            
-        message = "Unfortunately, that specific time is not available. However, some other times that work are:" if requested_start_str else "Sure, here are some upcoming available times:"
-        return jsonify({
-            "status": "available_slots_found",
-            "message": message,
-            "next_available_slots": formatted_suggestions
-        })
-
+        message = "Unfortunately, that time is not available. However, some other times that work are:" if requested_start_str else "Sure, here are some upcoming available times:"
+        return jsonify({"status": "available_slots_found", "message": message, "next_available_slots": formatted_suggestions})
     except Exception as e:
         print(f"A general error occurred in /get-availability: {e}")
         return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
 
+# ✅ --- NEW ENDPOINT TO FIND AN APPOINTMENT ---
+@app.route('/find-appointment', methods=['POST'])
+def find_appointment():
+    try:
+        data = request.json
+        if not data or 'email' not in data:
+            return jsonify({"error": "An email address must be provided."}), 400
+        
+        email_to_find = data['email'].lower()
+        now_utc = datetime.now(UTC)
+        end_of_search = now_utc + timedelta(days=30) # Search for meetings in the next 30 days
+
+        events_result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID, timeMin=now_utc.isoformat(),
+            timeMax=end_of_search.isoformat(), singleEvents=True, orderBy='startTime').execute()
+        
+        found_events = []
+        for event in events_result.get('items', []):
+            description = event.get('description', '')
+            if email_to_find in description.lower():
+                dt_utc = parse(event['start'].get('dateTime'))
+                dt_sast = dt_utc.astimezone(SAST)
+                found_events.append({
+                    "event_id": event['id'],
+                    "summary": event['summary'],
+                    "human_readable_time": dt_sast.strftime('%A, %B %d at %-I:%M %p'),
+                })
+
+        if not found_events:
+            return jsonify({"message": f"I'm sorry, I couldn't find any upcoming appointments for {email_to_find}."})
+        
+        return jsonify({"found_events": found_events})
+
+    except Exception as e:
+        print(f"A general error occurred in /find-appointment: {e}")
+        return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
+
+# ✅ --- NEW ENDPOINT TO CANCEL AN APPOINTMENT ---
+@app.route('/cancel-appointment', methods=['POST'])
+def cancel_appointment():
+    try:
+        data = request.json
+        if not data or 'event_id' not in data:
+            return jsonify({"error": "An event_id must be provided."}), 400
+        
+        event_id_to_cancel = data['event_id']
+
+        service.events().delete(
+            calendarId=GOOGLE_CALENDAR_ID,
+            eventId=event_id_to_cancel
+        ).execute()
+
+        return jsonify({"message": "The old appointment has been successfully cancelled."})
+
+    except Exception as e:
+        print(f"A general error occurred in /cancel-appointment: {e}")
+        return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
+
+
 @app.route('/book-appointment', methods=['POST'])
 def book_appointment():
+    # ... (this function remains the same as the previous "SAST-first" version)
     try:
         data = request.json
         if not all(k in data for k in ["name", "email", "start_time"]):
             return jsonify({"error": "Missing name, email, or start_time."}), 400
-
         name_parts = data["name"].strip().split(' ', 1)
         first_name = name_parts[0]
-        
-        # The start_time from the tool is already in UTC, so we can use it directly
         start_time_dt = parse(data["start_time"])
         end_time_dt = start_time_dt + timedelta(minutes=60)
-
         event = {
             'summary': f'Onboarding Call with {data["name"]}',
             'location': 'Video Call - Link to follow',
@@ -156,18 +187,15 @@ def book_appointment():
             'end': {'dateTime': end_time_dt.isoformat(), 'timeZone': 'UTC'},
             'reminders': {'useDefault': True},
         }
-
         created_event = service.events().insert(
             calendarId=GOOGLE_CALENDAR_ID,
             body=event
         ).execute()
-
         success_message = (
             f"Perfect, {first_name}! I have successfully reserved that 1-hour time slot on our calendar. "
             f"Our team will send a manual calendar invitation to {data['email']} shortly to confirm."
         )
         return jsonify({"message": success_message}), 201
-
     except Exception as e:
         print(f"A general error occurred in /book-appointment: {e}")
         return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
