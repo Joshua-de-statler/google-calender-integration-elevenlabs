@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -7,6 +8,7 @@ from dateutil.parser import parse
 from datetime import datetime, timedelta
 import google.oauth2.service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError  # ✅ --- IMPORT ADDED
 import pytz
 
 # Load environment variables
@@ -48,7 +50,7 @@ def health_check():
 # --- API Endpoints ---
 @app.route('/get-availability', methods=['POST'])
 def get_availability():
-    # ... (this function remains the same as the previous "SAST-first" version)
+    # This function remains the same
     try:
         data = request.json or {}
         requested_start_str = data.get('start_time')
@@ -69,7 +71,7 @@ def get_availability():
                 calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start_utc.isoformat(),
                 timeMax=requested_end_utc.isoformat(), singleEvents=True).execute()
             if not events_result.get('items', []):
-                return jsonify({"status": "available", "iso_8061": requested_start_utc.isoformat()}) # Corrected key
+                return jsonify({"status": "available", "iso_8601": requested_start_utc.isoformat()})
             else:
                 pass
         now_utc = now_sast.astimezone(UTC)
@@ -109,22 +111,19 @@ def get_availability():
         print(f"A general error occurred in /get-availability: {e}")
         return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
 
-# ✅ --- NEW ENDPOINT TO FIND AN APPOINTMENT ---
 @app.route('/find-appointment', methods=['POST'])
 def find_appointment():
+    # This function remains the same
     try:
         data = request.json
         if not data or 'email' not in data:
             return jsonify({"error": "An email address must be provided."}), 400
-        
         email_to_find = data['email'].lower()
         now_utc = datetime.now(UTC)
-        end_of_search = now_utc + timedelta(days=30) # Search for meetings in the next 30 days
-
+        end_of_search = now_utc + timedelta(days=30)
         events_result = service.events().list(
             calendarId=GOOGLE_CALENDAR_ID, timeMin=now_utc.isoformat(),
             timeMax=end_of_search.isoformat(), singleEvents=True, orderBy='startTime').execute()
-        
         found_events = []
         for event in events_result.get('items', []):
             description = event.get('description', '')
@@ -136,19 +135,16 @@ def find_appointment():
                     "summary": event['summary'],
                     "human_readable_time": dt_sast.strftime('%A, %B %d at %-I:%M %p'),
                 })
-
         if not found_events:
             return jsonify({"message": f"I'm sorry, I couldn't find any upcoming appointments for {email_to_find}."})
-        
         return jsonify({"found_events": found_events})
-
     except Exception as e:
         print(f"A general error occurred in /find-appointment: {e}")
         return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
 
-# ✅ --- NEW ENDPOINT TO CANCEL AN APPOINTMENT ---
 @app.route('/cancel-appointment', methods=['POST'])
 def cancel_appointment():
+    # ✅ --- MODIFICATION: ADDED SPECIFIC ERROR HANDLING ---
     try:
         data = request.json
         if not data or 'event_id' not in data:
@@ -163,14 +159,25 @@ def cancel_appointment():
 
         return jsonify({"message": "The old appointment has been successfully cancelled."})
 
+    except HttpError as e:
+        # This specifically catches errors from the Google API.
+        # If the event ID doesn't exist, Google returns a 404 error.
+        if e.resp.status == 404:
+            print(f"Attempted to cancel a non-existent event: {event_id_to_cancel}")
+            return jsonify({"error": "It seems that appointment does not exist or may have already been cancelled."}), 404
+        else:
+            # For other Google API errors (like permissions issues)
+            print(f"A Google API error occurred in /cancel-appointment: {e}")
+            return jsonify({"error": "An issue occurred with the Google Calendar API."}), 500
     except Exception as e:
+        # This catches any other unexpected errors in the code.
         print(f"A general error occurred in /cancel-appointment: {e}")
         return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
 
 
 @app.route('/book-appointment', methods=['POST'])
 def book_appointment():
-    # ... (this function remains the same as the previous "SAST-first" version)
+    # This function remains the same
     try:
         data = request.json
         if not all(k in data for k in ["name", "email", "start_time"]):
