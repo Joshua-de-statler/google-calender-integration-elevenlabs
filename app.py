@@ -23,7 +23,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not all([GOOGLE_CALENDAR_ID, GOOGLE_CREDENTIALS_STR, SUPABASE_URL, SUPABASE_KEY]):
-    raise RuntimeError("All environment variables must be set.")
+    raise RuntimeError("All required environment variables must be set.")
 
 try:
     if GOOGLE_CREDENTIALS_STR.startswith('{'):
@@ -55,6 +55,7 @@ def get_availability():
         data = request.json or {}
         requested_start_str = data.get('start_time')
         now_sast = datetime.now(SAST)
+
         if requested_start_str:
             try:
                 naive_dt = parse(requested_start_str)
@@ -129,6 +130,7 @@ def book_appointment():
         if not all(k in data for k in ["name", "email", "start_time"]):
             return jsonify({"error": "Missing required fields."}), 400
 
+        # ✅ --- Get new optional fields from the agent ---
         goal = data.get("goal", "Not provided")
         monthly_budget = data.get("monthly_budget", 0)
         company_name = data.get("company_name", "Not provided")
@@ -139,7 +141,7 @@ def book_appointment():
         start_time_dt = parse(data["start_time"])
         end_time_dt = start_time_dt + timedelta(minutes=60)
         
-        # ✅ --- MODIFICATION: Updated summary and description to match your format ---
+        # ✅ --- Create the new, detailed event format ---
         summary = f"Onboarding call with {data['name']} from {company_name} to discuss the 'Project Pipeline AI'."
         
         description = (
@@ -161,6 +163,7 @@ def book_appointment():
         created_event = google_service.events().insert(
             calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
         
+        # ✅ --- Save the expanded data to Supabase ---
         try:
             supabase.table("meetings").insert({
                 "full_name": data["name"],
@@ -168,7 +171,7 @@ def book_appointment():
                 "company_name": company_name,
                 "start_time": data["start_time"],
                 "goal": goal,
-                "monthly_budget": monthly_budget,
+                "monthly_budget": float(monthly_budget), # Ensure budget is a number
                 "google_calendar_event_id": created_event.get('id')
             }).execute()
             print("Successfully saved lead to Supabase.")
