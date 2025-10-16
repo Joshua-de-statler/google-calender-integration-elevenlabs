@@ -61,31 +61,40 @@ def get_availability():
                 requested_start_sast = SAST.localize(naive_dt)
             except (ValueError, TypeError):
                 return jsonify({"error": "Invalid date format."}), 400
+            
             if requested_start_sast < now_sast:
                 return jsonify({"status": "unavailable", "message": "Sorry, that time is in the past."})
+            
             if not (0 <= requested_start_sast.weekday() <= 4 and 8 <= requested_start_sast.hour < 16):
                  return jsonify({"status": "unavailable", "message": "Apologies, that's outside our business hours of Monday to Friday, 8 AM to 4 PM."})
+
             requested_start_utc = requested_start_sast.astimezone(pytz.utc)
             requested_end_utc = requested_start_utc + timedelta(minutes=60)
             events_result = google_service.events().list(
                 calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start_utc.isoformat(),
                 timeMax=requested_end_utc.isoformat(), singleEvents=True).execute()
+            
             if not events_result.get('items', []):
                 return jsonify({"status": "available", "iso_8601": requested_start_utc.isoformat()})
             else:
                 pass
+
         now_utc = now_sast.astimezone(pytz.utc)
         search_start_time = now_utc + timedelta(minutes=15)
         end_of_search_window = now_utc + timedelta(days=14)
+        
         all_busy_slots_result = google_service.events().list(
             calendarId=GOOGLE_CALENDAR_ID, timeMin=now_utc.isoformat(),
             timeMax=end_of_search_window.isoformat(), singleEvents=True, orderBy='startTime').execute()
         all_busy_slots = all_busy_slots_result.get('items', [])
+
         next_available_slots = []
         check_time_utc = search_start_time
+        
         while len(next_available_slots) < 5 and check_time_utc < end_of_search_window:
             potential_end_time_utc = check_time_utc + timedelta(minutes=60)
             check_time_sast = check_time_utc.astimezone(SAST)
+            
             if (0 <= check_time_sast.weekday() <= 4 and 8 <= check_time_sast.hour < 16):
                 is_free = True
                 for event in all_busy_slots:
@@ -96,14 +105,17 @@ def get_availability():
                 if is_free:
                     next_available_slots.append(check_time_utc.isoformat())
             check_time_utc += timedelta(minutes=15)
+
         if not next_available_slots:
             return jsonify({"status": "unavailable", "message": "Sorry, I couldn't find any open 1-hour slots."})
+
         formatted_suggestions = []
         for slot_iso in next_available_slots:
             dt_utc = parse(slot_iso)
             dt_sast = dt_utc.astimezone(SAST)
             human_readable = dt_sast.strftime('%A, %B %d at %-I:%M %p')
             formatted_suggestions.append({"human_readable": human_readable, "iso_8601": slot_iso})
+            
         message = "Unfortunately, that time is not available. However, some other times that work are:" if requested_start_str else "Sure, here are some upcoming available times:"
         return jsonify({"status": "available_slots_found", "message": message, "next_available_slots": formatted_suggestions})
     except Exception as e:
@@ -117,7 +129,6 @@ def book_appointment():
         if not all(k in data for k in ["name", "email", "start_time"]):
             return jsonify({"error": "Missing required fields."}), 400
 
-        # ✅ --- GET NEW OPTIONAL FIELDS ---
         goal = data.get("goal", "Not provided")
         monthly_budget = data.get("monthly_budget", 0)
         company_name = data.get("company_name", "Not provided")
@@ -128,16 +139,18 @@ def book_appointment():
         start_time_dt = parse(data["start_time"])
         end_time_dt = start_time_dt + timedelta(minutes=60)
         
-        # ✅ --- CREATE DETAILED DESCRIPTION ---
+        # ✅ --- MODIFICATION: Updated summary and description to match your format ---
+        summary = f"Onboarding call with {data['name']} from {company_name} to discuss the 'Project Pipeline AI'."
+        
         description = (
-            f"A 60-minute onboarding call for {data['name']} from {company_name}.\n"
-            f"Invitee Email: {data['email']}\n\n"
             f"Stated Goal: {goal}\n"
-            f"Monthly Budget: R{monthly_budget}"
+            f"Stated Budget: R{monthly_budget}/month\n\n"
+            f"---\n"
+            f"Lead Contact: {data['email']}"
         )
 
         event = {
-            'summary': f'Onboarding Call with {data["name"]} ({company_name})',
+            'summary': summary,
             'location': 'Video Call - Link to follow',
             'description': description,
             'start': {'dateTime': start_time_dt.isoformat(), 'timeZone': 'UTC'},
@@ -148,7 +161,6 @@ def book_appointment():
         created_event = google_service.events().insert(
             calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
         
-        # ✅ --- SAVE EXPANDED DATA TO SUPABASE ---
         try:
             supabase.table("meetings").insert({
                 "full_name": data["name"],
