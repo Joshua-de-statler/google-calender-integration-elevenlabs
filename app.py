@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import google.oauth2.service_account
 from googleapiclient.discovery import build
 import pytz
+from supabase import create_client, Client # ✅ --- IMPORT ADDED ---
 
 # Load environment variables
 load_dotenv()
@@ -18,9 +19,12 @@ app = Flask(__name__)
 # --- Configuration ---
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 GOOGLE_CREDENTIALS_STR = os.getenv("GOOGLE_CREDENTIALS_JSON")
+# ✅ --- SUPABASE CONFIG ADDED ---
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-if not GOOGLE_CALENDAR_ID or not GOOGLE_CREDENTIALS_STR:
-    raise RuntimeError("GOOGLE_CALENDAR_ID and GOOGLE_CREDENTIALS_JSON must be set.")
+if not all([GOOGLE_CALENDAR_ID, GOOGLE_CREDENTIALS_STR, SUPABASE_URL, SUPABASE_KEY]):
+    raise RuntimeError("All environment variables must be set.")
 
 try:
     # This handles both raw JSON for local testing and Base64 for production
@@ -32,13 +36,13 @@ try:
 except Exception as e:
     raise ValueError(f"Failed to decode GOOGLE_CREDENTIALS_JSON. Error: {e}")
 
-# --- Google API & Timezone Setup ---
+# --- API Client Setup ---
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 credentials = google.oauth2.service_account.Credentials.from_service_account_info(
     GOOGLE_CREDENTIALS_DICT, scopes=SCOPES
 )
-service = build('calendar', 'v3', credentials=credentials)
-UTC = pytz.utc
+google_service = build('calendar', 'v3', credentials=credentials)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) # ✅ --- SUPABASE CLIENT ADDED ---
 SAST = pytz.timezone('Africa/Johannesburg')
 
 # --- Health Check Endpoint ---
@@ -54,7 +58,6 @@ def get_availability():
         requested_start_str = data.get('start_time')
         now_sast = datetime.now(SAST)
 
-        # Scenario 1: User requested a specific time
         if requested_start_str:
             try:
                 naive_dt = parse(requested_start_str)
@@ -68,23 +71,23 @@ def get_availability():
             if not (0 <= requested_start_sast.weekday() <= 4 and 8 <= requested_start_sast.hour < 16):
                  return jsonify({"status": "unavailable", "message": "Apologies, that's outside our business hours of Monday to Friday, 8 AM to 4 PM."})
 
-            requested_start_utc = requested_start_sast.astimezone(UTC)
+            requested_start_utc = requested_start_sast.astimezone(pytz.utc)
             requested_end_utc = requested_start_utc + timedelta(minutes=60)
-            events_result = service.events().list(
+
+            events_result = google_service.events().list(
                 calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start_utc.isoformat(),
                 timeMax=requested_end_utc.isoformat(), singleEvents=True).execute()
             
             if not events_result.get('items', []):
                 return jsonify({"status": "available", "iso_8601": requested_start_utc.isoformat()})
             else:
-                pass # Fall through to find other slots
+                pass
 
-        # Scenario 2: Find next available slots
-        now_utc = now_sast.astimezone(UTC)
+        now_utc = now_sast.astimezone(pytz.utc)
         search_start_time = now_utc + timedelta(minutes=15)
         end_of_search_window = now_utc + timedelta(days=14)
         
-        all_busy_slots_result = service.events().list(
+        all_busy_slots_result = google_service.events().list(
             calendarId=GOOGLE_CALENDAR_ID, timeMin=now_utc.isoformat(),
             timeMax=end_of_search_window.isoformat(), singleEvents=True, orderBy='startTime').execute()
         all_busy_slots = all_busy_slots_result.get('items', [])
@@ -119,8 +122,12 @@ def get_availability():
             human_readable = dt_sast.strftime('%A, %B %d at %-I:%M %p')
             formatted_suggestions.append({"human_readable": human_readable, "iso_8601": slot_iso})
             
-        message = "Unfortunately, that time is not available. However, some other times that work are:" if requested_start_str else "Sure, here are some upcoming available times:"
-        return jsonify({"status": "available_slots_found", "message": message, "next_available_slots": formatted_suggestions})
+        message = "Unfortunately, that specific time is not available. However, some other times that work are:" if requested_start_str else "Sure, here are some upcoming available times:"
+        return jsonify({
+            "status": "available_slots_found",
+            "message": message,
+            "next_available_slots": formatted_suggestions
+        })
     except Exception as e:
         print(f"A general error occurred in /get-availability: {e}")
         return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
@@ -147,10 +154,25 @@ def book_appointment():
             'reminders': {'useDefault': True},
         }
 
-        created_event = service.events().insert(
+        created_event = google_service.events().insert(
             calendarId=GOOGLE_CALENDAR_ID,
             body=event
         ).execute()
+        
+        # ✅ --- SAVE TO SUPABASE ---
+        try:
+            supabase.table("meetings").insert({
+                "full_name": data["name"],
+                "email": data["email"],
+                "start_time": data["start_time"],
+                "google_calendar_event_id": created_event.get('id')
+            }).execute()
+            print("Successfully saved lead to Supabase.")
+        except Exception as e:
+            # If Supabase fails, we don't want to crash the whole request.
+            # We'll just log the error and continue.
+            print(f"Error saving lead to Supabase: {e}")
+        # --- END SAVE TO SUPABASE ---
 
         success_message = (
             f"Perfect, {first_name}! I have successfully reserved that 1-hour time slot on our calendar. "
