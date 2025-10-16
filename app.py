@@ -1,14 +1,15 @@
+# app.py
 import os
 import json
-import base64
-import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from dateutil.parser import parse
 from datetime import datetime, timedelta
-import google.oauth2.service_account
-from googleapiclient.discovery import build
 import pytz
+from supabase import create_client, Client
+
+# Local imports from our new tool file
+from google_calendar_tool import create_calendar_event, google_service
 
 # Load environment variables
 load_dotenv()
@@ -17,28 +18,14 @@ app = Flask(__name__)
 
 # --- Configuration ---
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
-GOOGLE_CREDENTIALS_STR = os.getenv("GOOGLE_CREDENTIALS_JSON")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-if not all([GOOGLE_CALENDAR_ID, GOOGLE_CREDENTIALS_STR, SUPABASE_URL, SUPABASE_KEY]):
+if not all([GOOGLE_CALENDAR_ID, SUPABASE_URL, SUPABASE_KEY]):
     raise RuntimeError("All required environment variables must be set.")
 
-try:
-    if GOOGLE_CREDENTIALS_STR.startswith('{'):
-        GOOGLE_CREDENTIALS_DICT = json.loads(GOOGLE_CREDENTIALS_STR)
-    else:
-        decoded_creds_str = base64.b64decode(GOOGLE_CREDENTIALS_STR).decode('utf-8')
-        GOOGLE_CREDENTIALS_DICT = json.loads(decoded_creds_str)
-except Exception as e:
-    raise ValueError(f"Failed to decode GOOGLE_CREDENTIALS_JSON. Error: {e}")
-
 # --- API Client Setup ---
-SCOPES = ['https://www.googleapis.com/auth/calendar']
-credentials = google.oauth2.service_account.Credentials.from_service_account_info(
-    GOOGLE_CREDENTIALS_DICT, scopes=SCOPES
-)
-google_service = build('calendar', 'v3', credentials=credentials)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 UTC = pytz.utc
 SAST = pytz.timezone('Africa/Johannesburg')
 
@@ -47,7 +34,7 @@ SAST = pytz.timezone('Africa/Johannesburg')
 def health_check():
     return jsonify({"status": "healthy"}), 200
 
-# --- Main API Endpoints ---
+# --- Get Availability Endpoint (No changes needed here) ---
 @app.route('/get-availability', methods=['POST'])
 def get_availability():
     try:
@@ -57,16 +44,11 @@ def get_availability():
 
         if requested_start_str:
             try:
-                # ✅ --- ROBUST TIMEZONE FIX ---
-                # This new logic correctly handles both timezone-aware and naive timestamps.
                 parsed_dt = parse(requested_start_str)
                 if parsed_dt.tzinfo is None:
-                    # If the timestamp is naive, assume it's SAST
                     requested_start_sast = SAST.localize(parsed_dt)
                 else:
-                    # If it's already aware, just convert it to SAST
                     requested_start_sast = parsed_dt.astimezone(SAST)
-                # --- END FIX ---
             except (ValueError, TypeError):
                 return jsonify({"error": "Invalid date format."}), 400
 
@@ -130,59 +112,59 @@ def get_availability():
         print(f"A general error occurred in /get-availability: {e}")
         return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
 
+# --- MODIFIED BOOKING ENDPOINT ---
 @app.route('/book-appointment', methods=['POST'])
 def book_appointment():
     try:
         data = request.json
-        if not all(k in data for k in ["name", "email", "start_time"]):
+        required_fields = ["name", "email", "start_time", "monthly_budget"]
+        if not all(k in data for k in required_fields):
             return jsonify({"error": "Missing required fields."}), 400
 
-        goal = data.get("goal", "Not provided")
-        monthly_budget = data.get("monthly_budget", 0)
+        full_name = data["name"]
+        email = data["email"]
         company_name = data.get("company_name", "Not provided")
-
-        name_parts = data["name"].strip().split(' ', 1)
-        first_name = name_parts[0]
+        goal = data.get("goal", "Not provided")
+        monthly_budget = float(data["monthly_budget"])
+        start_time = data["start_time"]
         
-        start_time_dt = parse(data["start_time"])
-        end_time_dt = start_time_dt + timedelta(minutes=60)
+        # Disqualification logic from your system prompt
+        if monthly_budget < 8000:
+            return jsonify({
+                "message": "I appreciate you sharing that. Based on the budget you provided, it seems like our 'Project Pipeline AI' might not be the right fit. I appreciate your time and honesty!"
+            }), 200
         
-        summary = f"Onboarding call with {data['name']} from {company_name} to discuss the 'Project Pipeline AI'."
+        # Define summary and description for the calendar event
+        summary = f"Onboard Call with {company_name} | Zappies AI"
         description = (
+            f"Onboarding call with {full_name} from {company_name} to discuss the 'Project Pipeline AI'.\n\n"
             f"Stated Goal: {goal}\n"
-            f"Stated Budget: R{monthly_budget}/month\n\n"
-            f"---\n"
-            f"Lead Contact: {data['email']}"
+            f"Stated Budget: R{monthly_budget}/month"
         )
-
-        event = {
-            'summary': summary, 'location': 'Video Call - Link to follow',
-            'description': description,
-            'start': {'dateTime': start_time_dt.isoformat(), 'timeZone': 'UTC'},
-            'end': {'dateTime': end_time_dt.isoformat(), 'timeZone': 'UTC'},
-            'reminders': {'useDefault': True},
-        }
-
-        created_event = google_service.events().insert(
-            calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
         
-        try:
-            supabase.table("meetings").insert({
-                "full_name": data["name"],
-                "email": data["email"],
-                "company_name": company_name,
-                "start_time": data["start_time"],
-                "goal": goal,
-                "monthly_budget": float(monthly_budget),
-                "google_calendar_event_id": created_event.get('id')
-            }).execute()
-            print("Successfully saved lead to Supabase.")
-        except Exception as e:
-            print(f"Error saving lead to Supabase: {e}")
+        # STEP 1: Create the Google Calendar event using the robust tool
+        created_event = create_calendar_event(
+            start_time=start_time,
+            summary=summary,
+            description=description,
+            attendees=[email]
+        )
+        
+        # STEP 2: Save the lead and the event ID to Supabase
+        supabase.table("meetings").insert({
+            "full_name": full_name,
+            "email": email,
+            "company_name": company_name,
+            "start_time": start_time,
+            "goal": goal,
+            "monthly_budget": monthly_budget,
+            "google_calendar_event_id": created_event.get('id')
+        }).execute()
 
+        first_name = full_name.split(' ')[0]
         success_message = (
-            f"Perfect, {first_name}! I've successfully booked your 1-hour call. "
-            f"Our team will send a calendar invitation to {data['email']} shortly to confirm."
+            f"Perfect, {first_name}! I've successfully booked your call. "
+            f"You will receive a calendar invitation to {email} shortly to confirm."
         )
         return jsonify({"message": success_message}), 201
 
