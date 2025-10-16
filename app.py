@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 import google.oauth2.service_account
 from googleapiclient.discovery import build
 import pytz
-from supabase import create_client, Client
 
 # Load environment variables
 load_dotenv()
@@ -40,7 +39,7 @@ credentials = google.oauth2.service_account.Credentials.from_service_account_inf
     GOOGLE_CREDENTIALS_DICT, scopes=SCOPES
 )
 google_service = build('calendar', 'v3', credentials=credentials)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+UTC = pytz.utc
 SAST = pytz.timezone('Africa/Johannesburg')
 
 # --- Health Check Endpoint ---
@@ -58,18 +57,26 @@ def get_availability():
 
         if requested_start_str:
             try:
-                naive_dt = parse(requested_start_str)
-                requested_start_sast = SAST.localize(naive_dt)
+                # ✅ --- ROBUST TIMEZONE FIX ---
+                # This new logic correctly handles both timezone-aware and naive timestamps.
+                parsed_dt = parse(requested_start_str)
+                if parsed_dt.tzinfo is None:
+                    # If the timestamp is naive, assume it's SAST
+                    requested_start_sast = SAST.localize(parsed_dt)
+                else:
+                    # If it's already aware, just convert it to SAST
+                    requested_start_sast = parsed_dt.astimezone(SAST)
+                # --- END FIX ---
             except (ValueError, TypeError):
                 return jsonify({"error": "Invalid date format."}), 400
-            
+
             if requested_start_sast < now_sast:
                 return jsonify({"status": "unavailable", "message": "Sorry, that time is in the past."})
             
             if not (0 <= requested_start_sast.weekday() <= 4 and 8 <= requested_start_sast.hour < 16):
                  return jsonify({"status": "unavailable", "message": "Apologies, that's outside our business hours of Monday to Friday, 8 AM to 4 PM."})
 
-            requested_start_utc = requested_start_sast.astimezone(pytz.utc)
+            requested_start_utc = requested_start_sast.astimezone(UTC)
             requested_end_utc = requested_start_utc + timedelta(minutes=60)
             events_result = google_service.events().list(
                 calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start_utc.isoformat(),
@@ -80,7 +87,7 @@ def get_availability():
             else:
                 pass
 
-        now_utc = now_sast.astimezone(pytz.utc)
+        now_utc = now_sast.astimezone(UTC)
         search_start_time = now_utc + timedelta(minutes=15)
         end_of_search_window = now_utc + timedelta(days=14)
         
@@ -130,7 +137,6 @@ def book_appointment():
         if not all(k in data for k in ["name", "email", "start_time"]):
             return jsonify({"error": "Missing required fields."}), 400
 
-        # ✅ --- Get new optional fields from the agent ---
         goal = data.get("goal", "Not provided")
         monthly_budget = data.get("monthly_budget", 0)
         company_name = data.get("company_name", "Not provided")
@@ -141,9 +147,7 @@ def book_appointment():
         start_time_dt = parse(data["start_time"])
         end_time_dt = start_time_dt + timedelta(minutes=60)
         
-        # ✅ --- Create the new, detailed event format ---
         summary = f"Onboarding call with {data['name']} from {company_name} to discuss the 'Project Pipeline AI'."
-        
         description = (
             f"Stated Goal: {goal}\n"
             f"Stated Budget: R{monthly_budget}/month\n\n"
@@ -152,8 +156,7 @@ def book_appointment():
         )
 
         event = {
-            'summary': summary,
-            'location': 'Video Call - Link to follow',
+            'summary': summary, 'location': 'Video Call - Link to follow',
             'description': description,
             'start': {'dateTime': start_time_dt.isoformat(), 'timeZone': 'UTC'},
             'end': {'dateTime': end_time_dt.isoformat(), 'timeZone': 'UTC'},
@@ -163,7 +166,6 @@ def book_appointment():
         created_event = google_service.events().insert(
             calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
         
-        # ✅ --- Save the expanded data to Supabase ---
         try:
             supabase.table("meetings").insert({
                 "full_name": data["name"],
@@ -171,7 +173,7 @@ def book_appointment():
                 "company_name": company_name,
                 "start_time": data["start_time"],
                 "goal": goal,
-                "monthly_budget": float(monthly_budget), # Ensure budget is a number
+                "monthly_budget": float(monthly_budget),
                 "google_calendar_event_id": created_event.get('id')
             }).execute()
             print("Successfully saved lead to Supabase.")
