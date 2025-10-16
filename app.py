@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 import google.oauth2.service_account
 from googleapiclient.discovery import build
 import pytz
-from supabase import create_client, Client
 
 # Load environment variables
 load_dotenv()
@@ -19,7 +18,6 @@ app = Flask(__name__)
 # --- Configuration ---
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 GOOGLE_CREDENTIALS_STR = os.getenv("GOOGLE_CREDENTIALS_JSON")
-# ✅ --- SUPABASE CONFIG ADDED ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -27,7 +25,6 @@ if not all([GOOGLE_CALENDAR_ID, GOOGLE_CREDENTIALS_STR, SUPABASE_URL, SUPABASE_K
     raise RuntimeError("All required environment variables must be set.")
 
 try:
-    # This handles both raw JSON for local testing and Base64 for production
     if GOOGLE_CREDENTIALS_STR.startswith('{'):
         GOOGLE_CREDENTIALS_DICT = json.loads(GOOGLE_CREDENTIALS_STR)
     else:
@@ -42,7 +39,7 @@ credentials = google.oauth2.service_account.Credentials.from_service_account_inf
     GOOGLE_CREDENTIALS_DICT, scopes=SCOPES
 )
 google_service = build('calendar', 'v3', credentials=credentials)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) # ✅ --- SUPABASE CLIENT INITIALIZED ---
+UTC = pytz.utc
 SAST = pytz.timezone('Africa/Johannesburg')
 
 # --- Health Check Endpoint ---
@@ -60,21 +57,26 @@ def get_availability():
 
         if requested_start_str:
             try:
+                # ✅ --- ROBUST TIMEZONE FIX ---
+                # This new logic correctly handles both timezone-aware and naive timestamps.
                 parsed_dt = parse(requested_start_str)
                 if parsed_dt.tzinfo is None:
+                    # If the timestamp is naive, assume it's SAST
                     requested_start_sast = SAST.localize(parsed_dt)
                 else:
+                    # If it's already aware, just convert it to SAST
                     requested_start_sast = parsed_dt.astimezone(SAST)
+                # --- END FIX ---
             except (ValueError, TypeError):
                 return jsonify({"error": "Invalid date format."}), 400
-            
+
             if requested_start_sast < now_sast:
                 return jsonify({"status": "unavailable", "message": "Sorry, that time is in the past."})
             
             if not (0 <= requested_start_sast.weekday() <= 4 and 8 <= requested_start_sast.hour < 16):
                  return jsonify({"status": "unavailable", "message": "Apologies, that's outside our business hours of Monday to Friday, 8 AM to 4 PM."})
 
-            requested_start_utc = requested_start_sast.astimezone(pytz.utc)
+            requested_start_utc = requested_start_sast.astimezone(UTC)
             requested_end_utc = requested_start_utc + timedelta(minutes=60)
             events_result = google_service.events().list(
                 calendarId=GOOGLE_CALENDAR_ID, timeMin=requested_start_utc.isoformat(),
@@ -85,7 +87,7 @@ def get_availability():
             else:
                 pass
 
-        now_utc = now_sast.astimezone(pytz.utc)
+        now_utc = now_sast.astimezone(UTC)
         search_start_time = now_utc + timedelta(minutes=15)
         end_of_search_window = now_utc + timedelta(days=14)
         
@@ -164,7 +166,6 @@ def book_appointment():
         created_event = google_service.events().insert(
             calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
         
-        # ✅ --- SAVE TO SUPABASE LOGIC IMPLEMENTED ---
         try:
             supabase.table("meetings").insert({
                 "full_name": data["name"],
@@ -177,9 +178,7 @@ def book_appointment():
             }).execute()
             print("Successfully saved lead to Supabase.")
         except Exception as e:
-            # If Supabase fails, we don't crash. We just log the error.
-            print(f"CRITICAL: Error saving lead to Supabase: {e}")
-        # --- END SAVE TO SUPABASE ---
+            print(f"Error saving lead to Supabase: {e}")
 
         success_message = (
             f"Perfect, {first_name}! I've successfully booked your 1-hour call. "
