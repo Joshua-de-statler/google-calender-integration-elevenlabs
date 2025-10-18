@@ -9,3 +9,4 @@ google-auth-oauthlib
 pytz
 supabase
 pydantic
+email_validator
