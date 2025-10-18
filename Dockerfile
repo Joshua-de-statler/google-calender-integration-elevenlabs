@@ -1,16 +1,37 @@
-# Use an official Python runtime as a parent image
-FROM python:3.9-slim
+# Dockerfile
 
-# Set the working directory in the container
+# ---- Build Stage ----
+# Use a full Python image to build dependencies, which may have system-level requirements.
+FROM python:3.9 as builder
+
+# Set the working directory
 WORKDIR /app
 
-# Copy the dependencies file to the working directory
-COPY requirements.txt .
+# Install build-time dependencies
+RUN pip install --upgrade pip
 
-# Install any needed packages specified in requirements.txt
+# Copy only the requirements file and install dependencies
+# This leverages Docker's layer caching.
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of your app's code to the working directory
+
+# ---- Final Stage ----
+# Use a slim image for the final container to reduce its size.
+FROM python:3.9-slim
+
+# Set the working directory
+WORKDIR /app
+
+# Create a non-root user for security
+RUN useradd --create-home appuser
+USER appuser
+
+# Copy the installed dependencies from the builder stage
+COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy the application code
 COPY . .
 
 # Expose the port the app runs on
