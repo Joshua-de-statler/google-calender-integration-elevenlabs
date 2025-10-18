@@ -6,6 +6,7 @@ import base64
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import Optional
 
 import google.oauth2.service_account
 from dotenv import load_dotenv
@@ -54,7 +55,7 @@ class Config:
 
 # --- Pydantic Models for Input Validation ---
 class AvailabilityRequest(BaseModel):
-    start_time: str | None = None
+    start_time: Optional[str] = None
 
 class BookingRequest(BaseModel):
     name: str
