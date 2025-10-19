@@ -7,14 +7,14 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
-from functools import wraps  # <-- 1. IMPORT WRAPS
+from functools import wraps
 
 import google.oauth2.service_account
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from pydantic import BaseModel, EmailStr, Field, ValidationError
+from pydantic import BaseModel, EmailStr, Field, ValidationError # Ensure EmailStr is imported
 from supabase import Client, create_client
 from dateutil.parser import parse
 
@@ -27,7 +27,7 @@ class Config:
     GOOGLE_CREDENTIALS_STR = os.getenv("GOOGLE_CREDENTIALS_JSON")
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-    API_KEY = os.getenv("API_KEY")  # <-- 2. ADD API_KEY TO CONFIG
+    API_KEY = os.getenv("API_KEY")
     
     TIMEZONE = ZoneInfo('Africa/Johannesburg')
     BUSINESS_HOURS_START = 8
@@ -38,14 +38,12 @@ class Config:
 
     @staticmethod
     def setup_logging():
-        """Sets up basic logging for the application."""
         logging.basicConfig(level=logging.INFO,
                             format='%(asctime)s %(levelname)s: %(message)s',
                             datefmt='%Y-%m-%d %H:%M:%S')
 
     @staticmethod
     def get_google_credentials():
-        """Decodes and returns Google credentials."""
         if not Config.GOOGLE_CREDENTIALS_STR:
             raise ValueError("GOOGLE_CREDENTIALS_JSON environment variable not set.")
         try:
@@ -57,8 +55,9 @@ class Config:
             raise ValueError(f"Failed to decode GOOGLE_CREDENTIALS_JSON. Error: {e}")
 
 # --- Pydantic Models for Input Validation ---
+
 class AvailabilityRequest(BaseModel):
-    start_time: Optional[str] = None # Corrected for Python 3.9
+    start_time: Optional[str] = None
 
 class BookingRequest(BaseModel):
     name: str
@@ -68,11 +67,18 @@ class BookingRequest(BaseModel):
     monthly_budget: int = 0
     company_name: str = "Not provided"
 
+# --- NEW: Pydantic Model for Call Logging ---
+class CallLogRequest(BaseModel):
+    full_name: Optional[str] = "Not provided"
+    email: Optional[EmailStr] = None
+    company_name: Optional[str] = "Not provided"
+    goal: Optional[str] = "Not provided"
+    monthly_budget: Optional[int] = 0
+    resulted_in_meeting: bool = False # This is the key flag
+    disqualification_reason: Optional[str] = None
+
 # --- Service Abstractions ---
-# (GoogleCalendarService and SupabaseService classes remain unchanged)
-# ... [No changes to GoogleCalendarService or SupabaseService] ...
 class GoogleCalendarService:
-    """Handles interactions with the Google Calendar API."""
     SCOPES = ['https://www.googleapis.com/auth/calendar']
 
     def __init__(self, credentials_info, calendar_id):
@@ -83,7 +89,6 @@ class GoogleCalendarService:
         self.calendar_id = calendar_id
 
     def get_events(self, time_min, time_max):
-        """Fetches events from the calendar within a given time range."""
         try:
             events_result = self.service.events().list(
                 calendarId=self.calendar_id,
@@ -98,7 +103,6 @@ class GoogleCalendarService:
             raise
 
     def create_event(self, summary, description, start_time, end_time):
-        """Creates a new event on the calendar."""
         event = {
             'summary': summary,
             'location': 'Video Call - Link to follow',
@@ -119,28 +123,36 @@ class GoogleCalendarService:
 class SupabaseService:
     """Handles interactions with the Supabase database."""
     def __init__(self, url, key):
+        if not url or not key:
+            raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set.")
         self.supabase: Client = create_client(url, key)
 
     def save_meeting(self, meeting_data):
         """Saves meeting details to the 'meetings' table."""
         try:
             self.supabase.table("meetings").insert(meeting_data).execute()
-            logging.info("Successfully saved lead to Supabase.")
+            logging.info("Successfully saved lead to Supabase 'meetings' table.")
         except Exception as e:
-            logging.error(f"Error saving lead to Supabase: {e}")
+            logging.error(f"Error saving lead to 'meetings' table: {e}")
             # We don't re-raise here as failing to save to Supabase
             # shouldn't prevent the user from getting a success message.
 
+    # --- NEW: Method to log to 'call_history' ---
+    def log_call(self, call_data):
+        """Saves call details to the 'call_history' table."""
+        try:
+            self.supabase.table("call_history").insert(call_data).execute()
+            logging.info("Successfully logged call to 'call_history' table.")
+        except Exception as e:
+            logging.error(f"Error logging call to 'call_history' table: {e}")
+            # Don't re-raise, logging failure shouldn't kill the request
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
 Config.setup_logging()
 
-# Check for API_KEY on startup
 if not Config.API_KEY:
     logging.critical("API_KEY environment variable not set. Application will not run.")
-    # You could raise an error here to stop the app from starting
-    # raise RuntimeError("API_KEY environment variable not set.")
 
 try:
     google_creds = Config.get_google_credentials()
@@ -148,15 +160,14 @@ try:
     supabase_service = SupabaseService(Config.SUPABASE_URL, Config.SUPABASE_KEY)
 except (RuntimeError, ValueError) as e:
     logging.critical(f"Startup configuration error: {e}")
-
-# --- 3. API KEY DECORATOR ---
+    # Handle critical startup failure
+    
+# --- API Key Decorator ---
 def require_api_key(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        # Check header 'X-API-Key'
         api_key = request.headers.get('X-API-Key')
         if not api_key:
-            # Fallback to checking 'Authorization' header (e.g., "Bearer YOUR_KEY")
             auth_header = request.headers.get('Authorization')
             if auth_header and auth_header.startswith('Bearer '):
                 api_key = auth_header.split(' ')[1]
@@ -171,13 +182,12 @@ def require_api_key(f):
 # --- API Endpoints ---
 @app.route('/', methods=['GET'])
 def health_check():
-    # This endpoint is not protected, so you can ping it
-    # to check if the service is alive.
     return jsonify({"status": "healthy"}), 200
 
 @app.route('/get-availability', methods=['POST'])
-@require_api_key  # <-- 4. APPLY THE DECORATOR
+@require_api_key
 def get_availability():
+    # ... (This endpoint's code remains unchanged)
     try:
         data = AvailabilityRequest.model_validate(request.json or {})
     except ValidationError as e:
@@ -204,9 +214,8 @@ def get_availability():
         
         events = calendar_service.get_events(requested_start_utc, requested_end_utc)
         if not events:
-            return jsonify({"status": "available", "iso_8601": requested_start_utc.isoformat()})
+            return jsonify({"status": "available", "iso_8061": requested_start_utc.isoformat()})
 
-    # --- Find next available slots if requested time is unavailable or not provided ---
     now_utc = now_sast.astimezone(ZoneInfo("UTC"))
     search_start_time = now_utc + timedelta(minutes=15)
     end_of_search_window = now_utc + timedelta(days=Config.SEARCH_WINDOW_DAYS)
@@ -241,13 +250,14 @@ def get_availability():
     for slot_utc in next_available_slots:
         dt_sast = slot_utc.astimezone(Config.TIMEZONE)
         human_readable = dt_sast.strftime('%A, %B %d at %-I:%M %p')
-        formatted_suggestions.append({"human_readable": human_readable, "iso_8601": slot_utc.isoformat()})
+        formatted_suggestions.append({"human_readable": human_readable, "iso_8061": slot_utc.isoformat()})
         
     message = "Unfortunately, that time is not available. However, some other times that work are:" if data.start_time else "Sure, here are some upcoming available times:"
     return jsonify({"status": "available_slots_found", "message": message, "next_available_slots": formatted_suggestions})
 
+
 @app.route('/book-appointment', methods=['POST'])
-@require_api_key  # <-- 4. APPLY THE DECORATOR
+@require_api_key
 def book_appointment():
     try:
         data = BookingRequest.model_validate(request.json)
@@ -271,6 +281,7 @@ def book_appointment():
 
         created_event = calendar_service.create_event(summary, description, start_time_dt, end_time_dt)
         
+        # --- 1. Log to 'meetings' table (Original) ---
         meeting_data = {
             "full_name": data.name,
             "email": data.email,
@@ -281,6 +292,18 @@ def book_appointment():
             "google_calendar_event_id": created_event.get('id')
         }
         supabase_service.save_meeting(meeting_data)
+        
+        # --- 2. MODIFICATION: Log to 'call_history' table (New) ---
+        call_data = {
+            "full_name": data.name,
+            "email": data.email,
+            "company_name": data.company_name,
+            "goal": data.goal,
+            "monthly_budget": data.monthly_budget,
+            "resulted_in_meeting": True, # <-- Key change
+            "disqualification_reason": None
+        }
+        supabase_service.log_call(call_data)
 
         success_message = (
             f"Perfect, {first_name}! I've successfully booked your 1-hour call. "
@@ -290,6 +313,34 @@ def book_appointment():
 
     except Exception as e:
         logging.error(f"A general error occurred in /book-appointment: {e}")
+        return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
+
+# --- NEW: Endpoint for logging failed/disqualified calls ---
+@app.route('/log-call', methods=['POST'])
+@require_api_key
+def log_call_history():
+    """
+    Logs the details of a call that did NOT result in a meeting.
+    To be called by the agent upon disqualification or call termination.
+    """
+    try:
+        # Validate incoming data against the CallLogRequest model
+        data = CallLogRequest.model_validate(request.json)
+    except ValidationError as e:
+        return jsonify({"error": "Invalid input.", "details": e.errors()}), 400
+    
+    try:
+        # Convert Pydantic model to dict for Supabase
+        # .model_dump() is the Pydantic v2 equivalent of .dict()
+        call_data = data.model_dump(exclude_unset=True) 
+        
+        # Ensure the key flag is explicitly set, even if default
+        call_data["resulted_in_meeting"] = data.resulted_in_meeting 
+        
+        supabase_service.log_call(call_data)
+        return jsonify({"message": "Call log received."}), 201
+    except Exception as e:
+        logging.error(f"A general error occurred in /log-call: {e}")
         return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
 
 if __name__ == "__main__":
