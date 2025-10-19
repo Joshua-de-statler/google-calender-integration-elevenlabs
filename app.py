@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
+from functools import wraps  # <-- 1. IMPORT WRAPS
 
 import google.oauth2.service_account
 from dotenv import load_dotenv
@@ -26,6 +27,8 @@ class Config:
     GOOGLE_CREDENTIALS_STR = os.getenv("GOOGLE_CREDENTIALS_JSON")
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+    API_KEY = os.getenv("API_KEY")  # <-- 2. ADD API_KEY TO CONFIG
+    
     TIMEZONE = ZoneInfo('Africa/Johannesburg')
     BUSINESS_HOURS_START = 8
     BUSINESS_HOURS_END = 16
@@ -55,7 +58,7 @@ class Config:
 
 # --- Pydantic Models for Input Validation ---
 class AvailabilityRequest(BaseModel):
-    start_time: Optional[str] = None
+    start_time: Optional[str] = None # Corrected for Python 3.9
 
 class BookingRequest(BaseModel):
     name: str
@@ -66,6 +69,8 @@ class BookingRequest(BaseModel):
     company_name: str = "Not provided"
 
 # --- Service Abstractions ---
+# (GoogleCalendarService and SupabaseService classes remain unchanged)
+# ... [No changes to GoogleCalendarService or SupabaseService] ...
 class GoogleCalendarService:
     """Handles interactions with the Google Calendar API."""
     SCOPES = ['https://www.googleapis.com/auth/calendar']
@@ -126,9 +131,16 @@ class SupabaseService:
             # We don't re-raise here as failing to save to Supabase
             # shouldn't prevent the user from getting a success message.
 
+
 # --- Flask App Initialization ---
 app = Flask(__name__)
 Config.setup_logging()
+
+# Check for API_KEY on startup
+if not Config.API_KEY:
+    logging.critical("API_KEY environment variable not set. Application will not run.")
+    # You could raise an error here to stop the app from starting
+    # raise RuntimeError("API_KEY environment variable not set.")
 
 try:
     google_creds = Config.get_google_credentials()
@@ -136,14 +148,35 @@ try:
     supabase_service = SupabaseService(Config.SUPABASE_URL, Config.SUPABASE_KEY)
 except (RuntimeError, ValueError) as e:
     logging.critical(f"Startup configuration error: {e}")
-    # In a real app, you might exit here or have a degraded mode.
+
+# --- 3. API KEY DECORATOR ---
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Check header 'X-API-Key'
+        api_key = request.headers.get('X-API-Key')
+        if not api_key:
+            # Fallback to checking 'Authorization' header (e.g., "Bearer YOUR_KEY")
+            auth_header = request.headers.get('Authorization')
+            if auth_header and auth_header.startswith('Bearer '):
+                api_key = auth_header.split(' ')[1]
+
+        if api_key and api_key == Config.API_KEY:
+            return f(*args, **kwargs)
+        else:
+            logging.warning("Unauthorized API access attempt.")
+            return jsonify({"error": "Unauthorized"}), 401
+    return decorated_function
 
 # --- API Endpoints ---
 @app.route('/', methods=['GET'])
 def health_check():
+    # This endpoint is not protected, so you can ping it
+    # to check if the service is alive.
     return jsonify({"status": "healthy"}), 200
 
 @app.route('/get-availability', methods=['POST'])
+@require_api_key  # <-- 4. APPLY THE DECORATOR
 def get_availability():
     try:
         data = AvailabilityRequest.model_validate(request.json or {})
@@ -214,6 +247,7 @@ def get_availability():
     return jsonify({"status": "available_slots_found", "message": message, "next_available_slots": formatted_suggestions})
 
 @app.route('/book-appointment', methods=['POST'])
+@require_api_key  # <-- 4. APPLY THE DECORATOR
 def book_appointment():
     try:
         data = BookingRequest.model_validate(request.json)
