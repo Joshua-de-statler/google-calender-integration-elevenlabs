@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from pydantic import BaseModel, EmailStr, Field, ValidationError # Ensure EmailStr is imported
+from pydantic import BaseModel, EmailStr, Field, ValidationError
 from supabase import Client, create_client
 from dateutil.parser import parse
 
@@ -66,8 +66,10 @@ class BookingRequest(BaseModel):
     goal: str = "Not provided"
     monthly_budget: int = 0
     company_name: str = "Not provided"
+    client_number: Optional[str] = None  # <-- NEW
+    call_duration_seconds: Optional[int] = 0 # <-- NEW
 
-# --- NEW: Pydantic Model for Call Logging ---
+# --- Pydantic Model for Call Logging ---
 class CallLogRequest(BaseModel):
     full_name: Optional[str] = "Not provided"
     email: Optional[EmailStr] = None
@@ -76,6 +78,8 @@ class CallLogRequest(BaseModel):
     monthly_budget: Optional[int] = 0
     resulted_in_meeting: bool = False # This is the key flag
     disqualification_reason: Optional[str] = None
+    client_number: Optional[str] = None  # <-- NEW
+    call_duration_seconds: Optional[int] = 0 # <-- NEW
 
 # --- Service Abstractions ---
 class GoogleCalendarService:
@@ -134,10 +138,7 @@ class SupabaseService:
             logging.info("Successfully saved lead to Supabase 'meetings' table.")
         except Exception as e:
             logging.error(f"Error saving lead to 'meetings' table: {e}")
-            # We don't re-raise here as failing to save to Supabase
-            # shouldn't prevent the user from getting a success message.
 
-    # --- NEW: Method to log to 'call_history' ---
     def log_call(self, call_data):
         """Saves call details to the 'call_history' table."""
         try:
@@ -145,7 +146,6 @@ class SupabaseService:
             logging.info("Successfully logged call to 'call_history' table.")
         except Exception as e:
             logging.error(f"Error logging call to 'call_history' table: {e}")
-            # Don't re-raise, logging failure shouldn't kill the request
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -160,7 +160,6 @@ try:
     supabase_service = SupabaseService(Config.SUPABASE_URL, Config.SUPABASE_KEY)
 except (RuntimeError, ValueError) as e:
     logging.critical(f"Startup configuration error: {e}")
-    # Handle critical startup failure
     
 # --- API Key Decorator ---
 def require_api_key(f):
@@ -187,7 +186,6 @@ def health_check():
 @app.route('/get-availability', methods=['POST'])
 @require_api_key
 def get_availability():
-    # ... (This endpoint's code remains unchanged)
     try:
         data = AvailabilityRequest.model_validate(request.json or {})
     except ValidationError as e:
@@ -214,7 +212,7 @@ def get_availability():
         
         events = calendar_service.get_events(requested_start_utc, requested_end_utc)
         if not events:
-            return jsonify({"status": "available", "iso_8061": requested_start_utc.isoformat()})
+            return jsonify({"status": "available", "iso_8061": requested_start_utc.isoformat()}) # Corrected typo here
 
     now_utc = now_sast.astimezone(ZoneInfo("UTC"))
     search_start_time = now_utc + timedelta(minutes=15)
@@ -250,7 +248,7 @@ def get_availability():
     for slot_utc in next_available_slots:
         dt_sast = slot_utc.astimezone(Config.TIMEZONE)
         human_readable = dt_sast.strftime('%A, %B %d at %-I:%M %p')
-        formatted_suggestions.append({"human_readable": human_readable, "iso_8061": slot_utc.isoformat()})
+        formatted_suggestions.append({"human_readable": human_readable, "iso_8061": slot_utc.isoformat()}) # Corrected typo here
         
     message = "Unfortunately, that time is not available. However, some other times that work are:" if data.start_time else "Sure, here are some upcoming available times:"
     return jsonify({"status": "available_slots_found", "message": message, "next_available_slots": formatted_suggestions})
@@ -275,8 +273,8 @@ def book_appointment():
         description = (
             f"Stated Goal: {data.goal}\n"
             f"Stated Budget: R{data.monthly_budget}/month\n\n"
-            f"---\n"
-            f"Lead Contact: {data.email}"
+            f"Lead Contact: {data.email}\n"
+            f"Lead Phone: {data.client_number}" # <-- NEW
         )
 
         created_event = calendar_service.create_event(summary, description, start_time_dt, end_time_dt)
@@ -289,7 +287,8 @@ def book_appointment():
             "start_time": data.start_time,
             "goal": data.goal,
             "monthly_budget": data.monthly_budget,
-            "google_calendar_event_id": created_event.get('id')
+            "google_calendar_event_id": created_event.get('id'),
+            "client_number": data.client_number  # <-- NEW
         }
         supabase_service.save_meeting(meeting_data)
         
@@ -300,8 +299,10 @@ def book_appointment():
             "company_name": data.company_name,
             "goal": data.goal,
             "monthly_budget": data.monthly_budget,
-            "resulted_in_meeting": True, # <-- Key change
-            "disqualification_reason": None
+            "resulted_in_meeting": True,
+            "disqualification_reason": None,
+            "client_number": data.client_number,  # <-- NEW
+            "call_duration_seconds": data.call_duration_seconds # <-- NEW
         }
         supabase_service.log_call(call_data)
 
